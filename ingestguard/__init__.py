@@ -19,6 +19,14 @@ from ingestguard.parser import (
     compute_payload_hash,
     iter_validated_chunks,
 )
+from ingestguard.replayer import (
+    IngestGuardError,
+    IngestService,
+    MetricsCollector,
+    QuarantineAlreadyReplayedError,
+    QuarantineNotFoundError,
+    ReplayValidationError,
+)
 from ingestguard.store import (
     ChunkApplyResult,
     IngestStore,
@@ -46,5 +54,11 @@ __all__ = [
     "ChunkApplyResult",
     "IngestStore",
     "create_db_engine",
+    "IngestGuardError",
+    "ReplayValidationError",
+    "QuarantineNotFoundError",
+    "QuarantineAlreadyReplayedError",
+    "MetricsCollector",
+    "IngestService",
     "__version__",
 ]
