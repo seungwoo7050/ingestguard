@@ -12,6 +12,13 @@ from ingestguard.models import (
     ReplayRequest,
     SchemaSpec,
 )
+from ingestguard.parser import (
+    RejectedRow,
+    ValidatedRow,
+    build_row_validator,
+    compute_payload_hash,
+    iter_validated_chunks,
+)
 
 __version__ = "0.1.0"
 
@@ -26,5 +33,10 @@ __all__ = [
     "JobSummary",
     "QuarantineItem",
     "ReplayRequest",
+    "ValidatedRow",
+    "RejectedRow",
+    "compute_payload_hash",
+    "build_row_validator",
+    "iter_validated_chunks",
     "__version__",
 ]
