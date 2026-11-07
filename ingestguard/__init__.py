@@ -1,5 +1,6 @@
 """IngestGuard: Streaming chunk validation, idempotent record_key upsert, and quarantine replay."""
 
+from ingestguard.app import create_app
 from ingestguard.models import (
     Base,
     ColumnRule,
@@ -60,5 +61,6 @@ __all__ = [
     "QuarantineAlreadyReplayedError",
     "MetricsCollector",
     "IngestService",
+    "create_app",
     "__version__",
 ]
