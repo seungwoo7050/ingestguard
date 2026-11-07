@@ -19,6 +19,11 @@ from ingestguard.parser import (
     compute_payload_hash,
     iter_validated_chunks,
 )
+from ingestguard.store import (
+    ChunkApplyResult,
+    IngestStore,
+    create_db_engine,
+)
 
 __version__ = "0.1.0"
 
@@ -38,5 +43,8 @@ __all__ = [
     "compute_payload_hash",
     "build_row_validator",
     "iter_validated_chunks",
+    "ChunkApplyResult",
+    "IngestStore",
+    "create_db_engine",
     "__version__",
 ]
