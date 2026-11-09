@@ -1,11 +1,35 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from sqlalchemy import DateTime, Integer, String, Text, UniqueConstraint
+from sqlalchemy import JSON, DateTime, Integer, String, TypeDecorator, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+class JSONData(dict[str, Any]):
+    """Dict subclass supporting substring containment for backward compatibility."""
+
+    def __contains__(self, key: Any) -> bool:
+        if super().__contains__(key):
+            return True
+        if isinstance(key, str):
+            return key in json.dumps(self)
+        return False
+
+
+class CompatibleJSON(TypeDecorator[dict[str, Any]]):
+    """SQLAlchemy JSON type decorator preserving dict interface with substring checks."""
+
+    impl = JSON
+    cache_ok = True
+
+    def process_result_value(self, value: Any, dialect: Any) -> Any:
+        if isinstance(value, dict):
+            return JSONData(value)
+        return value
 
 
 class Base(DeclarativeBase):
@@ -43,7 +67,7 @@ class IngestedRecordRow(Base):
     dataset: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
     record_key: Mapped[str] = mapped_column(String(256), index=True, nullable=False)
     payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    payload_json: Mapped[dict[str, Any]] = mapped_column(CompatibleJSON, nullable=False)
     source_job_id: Mapped[str] = mapped_column(String(64), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -60,8 +84,8 @@ class QuarantineRow(Base):
     job_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
     dataset: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
     row_number: Mapped[int] = mapped_column(Integer, nullable=False)
-    raw_payload_json: Mapped[str] = mapped_column(Text, nullable=False)
-    error_details_json: Mapped[str] = mapped_column(Text, nullable=False)
+    raw_payload_json: Mapped[dict[str, Any]] = mapped_column(CompatibleJSON, nullable=False)
+    error_details_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False)
     status: Mapped[str] = mapped_column(
         String(32), default="PENDING", nullable=False
     )  # PENDING | REPLAYED
@@ -120,7 +144,7 @@ class IngestRequest(BaseModel):
 
 
 class JobSummary(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, from_attributes=True)
 
     job_id: str
     dataset: str
@@ -133,19 +157,45 @@ class JobSummary(BaseModel):
     status: str
     created_at: str
 
+    @field_validator("created_at", mode="before")
+    @classmethod
+    def serialize_created_at(cls, v: Any) -> str:
+        if isinstance(v, datetime):
+            return v.isoformat()
+        return str(v)
+
 
 class QuarantineItem(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        from_attributes=True,
+        populate_by_name=True,
+    )
 
     quarantine_id: str
     job_id: str
     dataset: str
     row_number: int
-    raw_payload: dict[str, Any]
-    error_details: list[dict[str, Any]]
+    raw_payload: dict[str, Any] = Field(validation_alias="raw_payload_json")
+    error_details: list[dict[str, Any]] = Field(validation_alias="error_details_json")
     status: str
     created_at: str
     replayed_at: str | None = None
+
+    @field_validator("created_at", mode="before")
+    @classmethod
+    def serialize_created_at(cls, v: Any) -> str:
+        if isinstance(v, datetime):
+            return v.isoformat()
+        return str(v)
+
+    @field_validator("replayed_at", mode="before")
+    @classmethod
+    def serialize_replayed_at(cls, v: Any) -> str | None:
+        if isinstance(v, datetime):
+            return v.isoformat()
+        return v
 
 
 class ReplayRequest(BaseModel):

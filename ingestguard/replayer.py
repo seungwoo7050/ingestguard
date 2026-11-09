@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-import asyncio
-import json
-import threading
 import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+from prometheus_client import CollectorRegistry, Counter, generate_latest
 from pydantic import ValidationError
 from sqlalchemy import select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from ingestguard.models import (
     IngestedRecordRow,
@@ -55,54 +54,50 @@ class QuarantineAlreadyReplayedError(IngestGuardError):
 
 
 class MetricsCollector:
-    """Thread-safe Prometheus metrics collector for ingestion counters."""
+    """Thread-safe Prometheus metrics collector using prometheus_client."""
 
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self.inserted_total: int = 0
-        self.skipped_total: int = 0
-        self.quarantined_total: int = 0
-        self.replayed_total: int = 0
+    def __init__(self, registry: CollectorRegistry | None = None) -> None:
+        self.registry = registry or CollectorRegistry()
+        self.inserted_counter = Counter(
+            "ingestguard_rows_inserted",
+            "Total number of successfully inserted rows.",
+            registry=self.registry,
+        )
+        self.skipped_counter = Counter(
+            "ingestguard_rows_skipped",
+            "Total number of skipped identical rows.",
+            registry=self.registry,
+        )
+        self.quarantined_counter = Counter(
+            "ingestguard_rows_quarantined",
+            "Total number of quarantined invalid rows.",
+            registry=self.registry,
+        )
+        self.replayed_counter = Counter(
+            "ingestguard_rows_replayed",
+            "Total number of successfully replayed quarantine rows.",
+            registry=self.registry,
+        )
 
     def inc_inserted(self, count: int = 1) -> None:
-        with self._lock:
-            self.inserted_total += count
+        if count > 0:
+            self.inserted_counter.inc(count)
 
     def inc_skipped(self, count: int = 1) -> None:
-        with self._lock:
-            self.skipped_total += count
+        if count > 0:
+            self.skipped_counter.inc(count)
 
     def inc_quarantined(self, count: int = 1) -> None:
-        with self._lock:
-            self.quarantined_total += count
+        if count > 0:
+            self.quarantined_counter.inc(count)
 
     def inc_replayed(self, count: int = 1) -> None:
-        with self._lock:
-            self.replayed_total += count
+        if count > 0:
+            self.replayed_counter.inc(count)
 
     def render_prometheus(self) -> str:
         """Render metrics in Prometheus plain text format."""
-        with self._lock:
-            inserted = self.inserted_total
-            skipped = self.skipped_total
-            quarantined = self.quarantined_total
-            replayed = self.replayed_total
-
-        lines = [
-            "# HELP ingestguard_rows_inserted_total Total number of successfully inserted rows.",
-            "# TYPE ingestguard_rows_inserted_total counter",
-            f"ingestguard_rows_inserted_total {inserted}",
-            "# HELP ingestguard_rows_skipped_total Total number of skipped identical rows.",
-            "# TYPE ingestguard_rows_skipped_total counter",
-            f"ingestguard_rows_skipped_total {skipped}",
-            "# HELP ingestguard_rows_quarantined_total Total number of quarantined invalid rows.",
-            "# TYPE ingestguard_rows_quarantined_total counter",
-            f"ingestguard_rows_quarantined_total {quarantined}",
-            "# HELP ingestguard_rows_replayed_total Total number of successfully replayed quarantine rows.",
-            "# TYPE ingestguard_rows_replayed_total counter",
-            f"ingestguard_rows_replayed_total {replayed}",
-        ]
-        return "\n".join(lines) + "\n"
+        return generate_latest(self.registry).decode("utf-8")
 
 
 class IngestService:
@@ -129,7 +124,6 @@ class IngestService:
         total_skipped = 0
         total_quarantined = 0
 
-        # Stream chunk iterator and apply chunks
         for validated_rows, rejected_rows in iter_validated_chunks(
             content=req.content,
             format_type=req.format_type,
@@ -159,71 +153,7 @@ class IngestService:
             quarantined=total_quarantined,
         )
 
-        return JobSummary(
-            job_id=final_job.job_id,
-            dataset=final_job.dataset,
-            format_type=final_job.format_type,
-            total_rows=final_job.total_rows,
-            inserted_rows=final_job.inserted_rows,
-            updated_rows=final_job.updated_rows,
-            skipped_rows=final_job.skipped_rows,
-            quarantined_rows=final_job.quarantined_rows,
-            status=final_job.status,
-            created_at=final_job.created_at.isoformat(),
-        )
-
-    def _sync_replay(
-        self,
-        quarantine_id: str,
-        record_key: str,
-        payload_hash: str,
-        dumped: dict[str, Any],
-    ) -> IngestedRecordRow:
-        with self.store._lock:
-            with self.store.session_factory() as session:
-                with session.begin():
-                    q_row = session.get(QuarantineRow, quarantine_id)
-                    if q_row is None:
-                        raise QuarantineNotFoundError(quarantine_id)
-                    if q_row.status == "REPLAYED":
-                        raise QuarantineAlreadyReplayedError(quarantine_id)
-
-                    dataset = q_row.dataset
-                    now = datetime.now(timezone.utc)
-
-                    stmt = select(IngestedRecordRow).where(
-                        IngestedRecordRow.dataset == dataset,
-                        IngestedRecordRow.record_key == record_key,
-                    )
-                    if self.store.engine.dialect.name != "sqlite":
-                        stmt = stmt.with_for_update()
-
-                    record = session.scalar(stmt)
-                    if record is None:
-                        record = IngestedRecordRow(
-                            dataset=dataset,
-                            record_key=record_key,
-                            payload_hash=payload_hash,
-                            payload_json=json.dumps(
-                                dumped, ensure_ascii=False, default=str
-                            ),
-                            source_job_id=q_row.job_id,
-                            updated_at=now,
-                        )
-                        session.add(record)
-                    else:
-                        record.payload_hash = payload_hash
-                        record.payload_json = json.dumps(
-                            dumped, ensure_ascii=False, default=str
-                        )
-                        record.source_job_id = q_row.job_id
-                        record.updated_at = now
-
-                    q_row.status = "REPLAYED"
-                    q_row.replayed_at = now
-
-                    self.metrics.inc_replayed(1)
-                    return record
+        return JobSummary.model_validate(final_job)
 
     async def replay_quarantine_row(
         self,
@@ -250,10 +180,46 @@ class IngestService:
         record_key = str(dumped[spec.key_field])
         payload_hash = compute_payload_hash(dumped)
 
-        return await asyncio.to_thread(
-            self._sync_replay,
-            quarantine_id,
-            record_key,
-            payload_hash,
-            dumped,
-        )
+        with self.store.session_factory() as session:
+            with session.begin():
+                q_row = session.get(QuarantineRow, quarantine_id)
+                if q_row is None:
+                    raise QuarantineNotFoundError(quarantine_id)
+                if q_row.status == "REPLAYED":
+                    raise QuarantineAlreadyReplayedError(quarantine_id)
+
+                dataset = q_row.dataset
+                now = datetime.now(timezone.utc)
+
+                upsert_stmt = sqlite_insert(IngestedRecordRow).values({
+                    "dataset": dataset,
+                    "record_key": record_key,
+                    "payload_hash": payload_hash,
+                    "payload_json": dumped,
+                    "source_job_id": q_row.job_id,
+                    "updated_at": now,
+                })
+                upsert_stmt = upsert_stmt.on_conflict_do_update(
+                    index_elements=["dataset", "record_key"],
+                    set_={
+                        "payload_hash": upsert_stmt.excluded.payload_hash,
+                        "payload_json": upsert_stmt.excluded.payload_json,
+                        "source_job_id": upsert_stmt.excluded.source_job_id,
+                        "updated_at": upsert_stmt.excluded.updated_at,
+                    },
+                )
+                session.execute(upsert_stmt)
+
+                q_row.status = "REPLAYED"
+                q_row.replayed_at = now
+
+                record = session.scalar(
+                    select(IngestedRecordRow).where(
+                        IngestedRecordRow.dataset == dataset,
+                        IngestedRecordRow.record_key == record_key,
+                    )
+                )
+                assert record is not None
+
+                self.metrics.inc_replayed(1)
+                return record

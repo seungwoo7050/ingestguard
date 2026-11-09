@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import json
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
 from fastapi import FastAPI, HTTPException, Query, Response, status
 from fastapi.responses import JSONResponse
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from ingestguard.models import (
     IngestRequest,
@@ -23,13 +23,28 @@ from ingestguard.replayer import (
 from ingestguard.store import IngestStore
 
 
+class AppSettings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="INGESTGUARD_")
+
+    db_url: str = "sqlite:///:memory:"
+    host: str = "0.0.0.0"
+    port: int = 8000
+
+
 def create_app(
     db_url: str = "sqlite:///:memory:",
     store: IngestStore | None = None,
     service: IngestService | None = None,
+    settings: AppSettings | None = None,
 ) -> FastAPI:
     """Create and configure FastAPI application instance with lifespan lifecycle."""
-    active_store = store or IngestStore(db_url=db_url)
+    active_settings = settings or AppSettings()
+    effective_db_url = (
+        db_url
+        if db_url != "sqlite:///:memory:" or not active_settings.db_url
+        else active_settings.db_url
+    )
+    active_store = store or IngestStore(db_url=effective_db_url)
     metrics = MetricsCollector()
     active_service = service or IngestService(store=active_store, metrics=metrics)
 
@@ -61,49 +76,26 @@ def create_app(
 
     @app.post("/v1/jobs/ingest", response_model=JobSummary, status_code=status.HTTP_201_CREATED)
     async def ingest_job(req: IngestRequest) -> JobSummary:
-        summary = await active_service.ingest_batch(req)
-        return summary
+        return await active_service.ingest_batch(req)
 
     @app.get("/v1/jobs/{job_id}", response_model=JobSummary)
     async def get_job(job_id: str) -> JobSummary:
         job = await active_store.get_job(job_id)
         if job is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Job '{job_id}' not found")
-        return JobSummary(
-            job_id=job.job_id,
-            dataset=job.dataset,
-            format_type=job.format_type,
-            total_rows=job.total_rows,
-            inserted_rows=job.inserted_rows,
-            updated_rows=job.updated_rows,
-            skipped_rows=job.skipped_rows,
-            quarantined_rows=job.quarantined_rows,
-            status=job.status,
-            created_at=job.created_at.isoformat(),
-        )
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=f"Job '{job_id}' not found"
+            )
+        return JobSummary.model_validate(job)
 
     @app.get("/v1/jobs/{job_id}/quarantine", response_model=list[QuarantineItem])
     async def get_job_quarantine(job_id: str) -> list[QuarantineItem]:
         job = await active_store.get_job(job_id)
         if job is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Job '{job_id}' not found")
-        rows = await active_store.get_quarantine_rows(job_id)
-        items: list[QuarantineItem] = []
-        for r in rows:
-            items.append(
-                QuarantineItem(
-                    quarantine_id=r.quarantine_id,
-                    job_id=r.job_id,
-                    dataset=r.dataset,
-                    row_number=r.row_number,
-                    raw_payload=json.loads(r.raw_payload_json),
-                    error_details=json.loads(r.error_details_json),
-                    status=r.status,
-                    created_at=r.created_at.isoformat(),
-                    replayed_at=r.replayed_at.isoformat() if r.replayed_at else None,
-                )
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=f"Job '{job_id}' not found"
             )
-        return items
+        rows = await active_store.get_quarantine_rows(job_id)
+        return [QuarantineItem.model_validate(r) for r in rows]
 
     @app.post("/v1/quarantine/{quarantine_id}/replay", response_model=None)
     async def replay_quarantine(quarantine_id: str, req: ReplayRequest) -> Response:
@@ -120,7 +112,7 @@ def create_app(
                     "dataset": record.dataset,
                     "record_key": record.record_key,
                     "payload_hash": record.payload_hash,
-                    "payload": json.loads(record.payload_json),
+                    "payload": record.payload_json,
                     "source_job_id": record.source_job_id,
                     "updated_at": record.updated_at.isoformat(),
                 },
@@ -142,19 +134,17 @@ def create_app(
         offset: int = Query(default=0, ge=0),
     ) -> list[dict[str, Any]]:
         rows = await active_store.get_records(dataset=dataset, limit=limit, offset=offset)
-        results: list[dict[str, Any]] = []
-        for r in rows:
-            results.append(
-                {
-                    "id": r.id,
-                    "dataset": r.dataset,
-                    "record_key": r.record_key,
-                    "payload_hash": r.payload_hash,
-                    "payload": json.loads(r.payload_json),
-                    "source_job_id": r.source_job_id,
-                    "updated_at": r.updated_at.isoformat(),
-                }
-            )
-        return results
+        return [
+            {
+                "id": r.id,
+                "dataset": r.dataset,
+                "record_key": r.record_key,
+                "payload_hash": r.payload_hash,
+                "payload": r.payload_json,
+                "source_job_id": r.source_job_id,
+                "updated_at": r.updated_at.isoformat(),
+            }
+            for r in rows
+        ]
 
     return app
